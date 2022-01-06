@@ -38,38 +38,40 @@ type TmpData map[string]*Log
 // Storage to contain primary store and session tmp store
 type Storage struct {
 	data    Data
-	tmp     TmpData
+	tmp     map[string]TmpData
 	version int
 }
 
 type DataBaser interface {
-	Get(key string) (string, error)
-	Set(key, value string)
-	Delete(key string)
-	Commit() error
+	Get(transkey, key string) (string, error)
+	Set(transkey, key, value string)
+	Delete(transkey, key string)
+	Commit(transkey string) error
 	Version() int
-	Abort()
+	Abort(transkey string)
 	Incr() int
 }
 
-func NewTransaction(db DataBaser) DataBaser {
+func NewTransaction(db DataBaser, transkey string) DataBaser {
 	db.Incr()
-	return db
+	tmp := make(TmpData)
+	store := db.(*Storage)
+	store.tmp[transkey] = tmp
+	return store
 }
 
 func NewStorage() DataBaser {
 	store := make(Data)
-	tmp := make(TmpData)
 	storage := &Storage{}
-	storage.tmp = tmp
+	storage.tmp = make(map[string]TmpData)
 	storage.data = store
 	storage.version = 0
 	return storage
 }
 
 // Get on store or current transaction store
-func (store *Storage) Get(key string) (string, error) {
-	if log, ok := store.tmp[key]; ok {
+func (store *Storage) Get(transkey, key string) (string, error) {
+	if log, ok := store.tmp[transkey][key]; ok {
 		if log.Action != Deleted {
 			return log.Value, nil
 		}
@@ -79,9 +81,12 @@ func (store *Storage) Get(key string) (string, error) {
 	return "", fmt.Errorf("%s: %s", ErrNotFound, key)
 }
 
-func (store *Storage) Set(key, value string) {
+func (store *Storage) Set(transkey, key, value string) {
 	nextlog := &Log{}
-	if log, ok := store.tmp[key]; ok {
+	if _, ok := store.tmp[transkey]; !ok {
+		return
+	}
+	if log, ok := store.tmp[transkey][key]; ok {
 		if log.Version != store.version {
 			nextlog.Prev = log
 		}
@@ -91,15 +96,16 @@ func (store *Storage) Set(key, value string) {
 	}
 	nextlog.Value = value
 	nextlog.Version = store.version
-	store.tmp[key] = nextlog
-	if store.version == 0 {
-		store.commitPrimary()
-	}
+	store.tmp[transkey][key] = nextlog
 }
 
-func (store *Storage) Delete(key string) {
+func (store *Storage) Delete(transkey, key string) {
 	nextlog := &Log{}
-	log, tmpok := store.tmp[key]
+	if _, ok := store.tmp[transkey]; !ok {
+		return
+	}
+
+	log, tmpok := store.tmp[transkey][key]
 	_, primaryok := store.data[key]
 	if !primaryok && !tmpok {
 		return
@@ -111,10 +117,7 @@ func (store *Storage) Delete(key string) {
 	}
 	nextlog.Action = Deleted
 	nextlog.Version = store.version
-	store.tmp[key] = nextlog
-	if store.version == 0 {
-		store.commitPrimary()
-	}
+	store.tmp[transkey][key] = nextlog
 }
 
 func (store *Storage) decr() {
@@ -123,66 +126,31 @@ func (store *Storage) decr() {
 	}
 }
 
-func (store *Storage) Commit() error {
-	isNextPrimary := (store.version - 1) <= 0
-
+func (store *Storage) Commit(transkey string) error {
 	defer store.decr()
-
-	if !isNextPrimary {
-		return store.commitParent()
-	}
-	return store.commitPrimary()
+	return store.commitPrimary(transkey)
 }
 
-func (store *Storage) commitParent() error {
-	count := 0
-	for key, log := range store.tmp {
-		if store.version == log.Version {
-			count++
-			log.Version--
-			prev := log.Prev
-			if prev != nil {
-				log.Prev = prev.Prev
-			}
-			store.tmp[key] = log
-		}
-	}
-	if count == 0 {
-		return fmt.Errorf(ErrNothingToCommit)
-	}
-	return nil
-}
-
-func (store *Storage) commitPrimary() error {
-	commitCount := len(store.tmp)
+func (store *Storage) commitPrimary(transkey string) error {
+	commitCount := len(store.tmp[transkey])
 	if commitCount == 0 {
 		return fmt.Errorf(ErrNothingToCommit)
 	}
-	for key, log := range store.tmp {
+	for key, log := range store.tmp[transkey] {
 		if log.Action == Updated || log.Action == Added {
 			store.data[key] = log.Value
 		} else if log.Action == Deleted {
 			delete(store.data, key)
-			delete(store.tmp, key)
+			delete(store.tmp[transkey], key)
 		}
 	}
-	store.tmp = make(TmpData)
+	store.tmp[transkey] = make(TmpData)
 	return nil
 }
 
-func (store *Storage) Abort() {
+func (store *Storage) Abort(transkey string) {
 	defer store.decr()
-
-	for key, log := range store.tmp {
-		if store.version == log.Version {
-			prev := log.Prev
-			if prev != nil {
-				store.tmp[key] = prev
-			} else {
-				delete(store.tmp, key)
-			}
-		}
-	}
+	delete(store.tmp, transkey)
 }
 
 func (store *Storage) Version() int {
